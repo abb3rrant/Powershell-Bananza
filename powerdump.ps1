@@ -207,29 +207,35 @@ function Get-Value([byte[]]$hive, [int]$nkOff, [string]$name) {
         $dataSize = [BitConverter]::ToUInt32($vk, 4)
         $dataOff  = [BitConverter]::ToInt32($vk, 8)
         if (($dataSize -band 0x80000000) -ne 0) {
+            # Inline: low 31 bits are the length (1..4 bytes), data lives in the dataOff field.
             $len = [int]($dataSize -band 0x7FFFFFFF)
-            if ($len -eq 0x3FFF) {
-                $hdr = Get-CellData $hive $dataOff
-                $total = [BitConverter]::ToInt32($hdr, 0)
+            $raw = [BitConverter]::GetBytes($dataOff)
+            $res = New-Object byte[] $len
+            [Array]::Copy($raw, 0, $res, 0, [Math]::Min($len, 4))
+            return ,$res
+        } else {
+            # External: a data cell at dataOff holds dataSize bytes.
+            $len = [int]$dataSize
+            if ($len -le 0) { return ,(New-Object byte[] 0) }
+            $cell = Get-CellData $hive $dataOff
+            if ($len -gt 0x3FD8 -and $cell.Length -ge 2 -and $cell[0] -eq 0x64 -and $cell[1] -eq 0x62) {
+                # 'db' big-data: cell = size(4), offsetToListOfSegments(4); list of 4-byte seg offsets.
+                $total = [BitConverter]::ToInt32($cell, 0)
+                $listOff = [BitConverter]::ToInt32($cell, 4)
+                $list = Get-CellData $hive $listOff
                 $res = New-Object byte[] $total
-                $idx = 0; $segIndex = 0
+                $idx = 0; $s = 0
                 while ($idx -lt $total) {
-                    $so = [BitConverter]::ToInt32($hdr, 8 + $segIndex * 4)
+                    $so = [BitConverter]::ToInt32($list, $s * 4)
                     $seg = Get-CellData $hive $so
                     $n = [Math]::Min(0x3FD8, $total - $idx)
                     [Array]::Copy($seg, 0, $res, $idx, [Math]::Min($n, $seg.Length))
-                    $idx += $n; $segIndex++
+                    $idx += $n; $s++
                 }
                 return ,$res
             } else {
                 return ,(Slice $hive ($script:HiveBase + $dataOff + 4) $len)
             }
-        } else {
-            $len = [int]$dataSize
-            $res = New-Object byte[] $len
-            $raw = [BitConverter]::GetBytes($dataOff)
-            [Array]::Copy($raw, 0, $res, 0, [Math]::Min($len, 4))
-            return ,$res
         }
     }
     return $null
@@ -239,8 +245,13 @@ function Get-KeyClass([byte[]]$hive, [int]$nkOff) {
     $nk = Get-Nk $hive $nkOff
     if ($nk.ClassLen -le 0 -or $nk.ClassOff -le 0) { return '' }
     $c = Get-CellData $hive $nk.ClassOff
-    $s = [Text.Encoding]::Unicode.GetString($c, 0, [Math]::Min($nk.ClassLen, $c.Length))
-    return $s.TrimEnd([char]0)
+    $n = [Math]::Min($nk.ClassLen, $c.Length)
+    # SysKey pieces are normally a UTF-16LE hex string, but tolerate ASCII too.
+    $u = ([Text.Encoding]::Unicode.GetString($c, 0, $n)).TrimEnd([char]0)
+    if ($u -match '^[0-9a-fA-F]+$') { return $u }
+    $a = ([Text.Encoding]::ASCII.GetString($c, 0, $n)).TrimEnd([char]0)
+    if ($a -match '^[0-9a-fA-F]+$') { return $a }
+    return $u
 }
 
 # ---------------------------------------------------------------------------
@@ -263,12 +274,19 @@ function Get-BootKey([byte[]]$system) {
     if (-not $lsa) { throw 'Lsa key not found' }
 
     $hex = ''
+    $parts = @()
     foreach ($k in @('JD', 'Skew1', 'GBG', 'Data')) {
         $sub = Find-SubKey $system $lsa.Off $k
-        if (-not $sub) { throw "Lsa subkey $k not found" }
-        $hex += (Get-KeyClass $system $sub.Off)
+        if (-not $sub) { throw "Lsa subkey $k not found under $($cs.Name)\Control\Lsa" }
+        $cls = Get-KeyClass $system $sub.Off
+        $parts += ("{0}: classlen={1} classoff=0x{2:x} class='{3}'" -f $k, $sub.ClassLen, $sub.ClassOff, $cls)
+        $hex += $cls
     }
-    if ($hex.Length -ne 32) { throw "bootkey class concat is $($hex.Length) hex chars (expected 32)" }
+    if ($hex.Length -ne 32) {
+        Write-Host '[!] bootkey class diagnostics:'
+        foreach ($p in $parts) { Write-Host "    $p" }
+        throw "bootkey class concat is $($hex.Length) hex chars (expected 32)"
+    }
 
     $raw = New-Object byte[] 16
     for ($i = 0; $i -lt 16; $i++) { $raw[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
@@ -289,10 +307,21 @@ function Test-Equal([byte[]]$a, [byte[]]$b) {
     return $true
 }
 
+# Real SAM hives put 'Domains' directly under root; some captured/re-imported
+# hives nest it under a key named 'SAM'. Handle both.
+function Resolve-SamDomains([byte[]]$sam, $root) {
+    $d = Find-SubKey $sam $root.Off 'Domains'
+    if (-not $d) {
+        $s = Find-SubKey $sam $root.Off 'SAM'
+        if ($s) { $d = Find-SubKey $sam $s.Off 'Domains' }
+    }
+    return $d
+}
+
 function Get-HashedBootKey([byte[]]$sam, [byte[]]$bootKey) {
     $rootOff = [BitConverter]::ToInt32($sam, 0x24)
     $root = Get-Nk $sam $rootOff
-    $domains = Find-SubKey $sam $root.Off 'Domains'
+    $domains = Resolve-SamDomains $sam $root
     if (-not $domains) { throw 'SAM DOMAINS key not found' }
     $account = Find-SubKey $sam $domains.Off 'Account'
     if (-not $account) { throw 'SAM Account key not found' }
@@ -351,7 +380,7 @@ function Get-SamHashes([byte[]]$sam, [byte[]]$bootKey) {
     $hbk = Get-HashedBootKey $sam $bootKey
     $rootOff = [BitConverter]::ToInt32($sam, 0x24)
     $root = Get-Nk $sam $rootOff
-    $domains = Find-SubKey $sam $root.Off 'Domains'
+    $domains = Resolve-SamDomains $sam $root
     $account = Find-SubKey $sam $domains.Off 'Account'
     $users = Find-SubKey $sam $account.Off 'Users'
     if (-not $users) { throw 'SAM Users key not found' }
